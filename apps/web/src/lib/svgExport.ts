@@ -1,3 +1,4 @@
+import { LASER_LAYER_ORDER, LASER_LAYER_STYLE, type LaserProcess } from "@/lib/laserLayers";
 import { projectDrawingMeshes, type DrawingMesh, type DrawingPoint, type DrawingPoint3 } from "@/lib/drawingProjection";
 
 export type SvgProjectionPolygon = ReadonlyArray<readonly [number, number]>;
@@ -63,6 +64,63 @@ export function toSvgProjection(layers: ReadonlyArray<SvgProjectionLayer>, title
     `<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="${svgNumber(width)}mm" height="${svgNumber(height)}mm" viewBox="${svgNumber(minX)} ${svgNumber(minY)} ${svgNumber(width)} ${svgNumber(height)}">`,
     `  <title>${xmlEscape(title)}</title>`,
     "  <desc>Top-view vector projection exported by Layerling</desc>",
+    ...body,
+    "</svg>",
+  ].join("\n");
+}
+
+export type SvgLaserLayer = {
+  process: Exclude<LaserProcess, "skip">;
+  polygons: ReadonlyArray<SvgProjectionPolygon>;
+};
+
+/**
+ * The top view for a laser (laserLayers.ts): one group per layer, as Inkscape layers, in LASER_LAYER_ORDER. A cut or
+ * a score is a hairline in its colour with no fill, as LightBurn takes a line; an engraving a filled black area.
+ */
+export function toSvgLaserLayers(layers: ReadonlyArray<SvgLaserLayer>, title = "Layerling design") {
+  const clean = LASER_LAYER_ORDER.flatMap((process) => {
+    const polygons = layers
+      .filter((layer) => layer.process === process)
+      .flatMap((layer) => layer.polygons)
+      .filter((polygon) => polygon.length >= 3 && polygon.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y)));
+    return polygons.length ? [{ process, polygons }] : [];
+  });
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  clean.forEach((layer) => layer.polygons.forEach((polygon) => polygon.forEach(([x, y]) => {
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  })));
+  if (!clean.length) throw new Error("SVG projection contains no readable contours");
+  const width = maxX - minX;
+  const height = maxY - minY;
+  if (width <= 0 || height <= 0) throw new Error("SVG projection does not enclose a visible area");
+
+  const body = clean.flatMap(({ process, polygons }) => {
+    const { svgColor, dxfLayer } = LASER_LAYER_STYLE[process];
+    const pathData = polygons
+      .map((polygon) => polygon.map(([x, y], index) => `${index === 0 ? "M" : "L"}${svgNumber(x)} ${svgNumber(y)}`).join(" ") + " Z")
+      .join(" ");
+    const paint = process === "engrave"
+      ? `fill="${svgColor}" fill-rule="evenodd" stroke="none"`
+      : `fill="none" stroke="${svgColor}" stroke-width="0.1"`;
+    return [
+      `  <g id="${dxfLayer.toLowerCase()}" inkscape:groupmode="layer" inkscape:label="${dxfLayer}">`,
+      `    <path d="${pathData}" ${paint}/>`,
+      "  </g>",
+    ];
+  });
+
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" version="1.1" width="${svgNumber(width)}mm" height="${svgNumber(height)}mm" viewBox="${svgNumber(minX)} ${svgNumber(minY)} ${svgNumber(width)} ${svgNumber(height)}">`,
+    `  <title>${xmlEscape(title)}</title>`,
+    "  <desc>Top-view laser layers exported by Layerling: red cut, blue score, black engrave</desc>",
     ...body,
     "</svg>",
   ].join("\n");

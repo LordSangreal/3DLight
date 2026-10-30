@@ -1,11 +1,13 @@
 "use client";
 
+import { DEFAULT_LASER_LAYERS, LASER_PROCESSES, laserColors, laserProcessFor, normalizedKerf, type LaserLayerOptions, type LaserProcess } from "@/lib/laserLayers";
 import { DEFAULT_STENCIL_BRIDGES, MAX_BRIDGE_COUNT, normalizedStencilBridges, type StencilBridgeOptions } from "@/lib/stencilBridges";
 import { GuideHelpLink } from "@/components/GuideHelpLink";
 import { MovableToolPanel } from "@/components/workplane/MovableToolPanel";
 import { CloudUpload, Download, EyeOff, FilePlus2, FolderOpen, ImagePlus, Info, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { t, type MessageKey } from "@/lib/i18n";
+import { parseMeasurementInput } from "@/lib/measurementUnits";
 import { useLanguage } from "@/lib/useLanguage";
 import { ToolbarImportIcon } from "../icons";
 import { AttachmentsPanel } from "./AttachmentsPanel";
@@ -79,7 +81,7 @@ export function TopActionPanel({
   estimateShapes: readonly WorkplaneShape[];
   onEstimatePrint: (shapes: readonly WorkplaneShape[]) => Promise<ExportSolidVolume>;
   onClose: () => void;
-  onExport: (format: DirectExportFormat, exportName: string, chooseFile?: boolean, svgView?: SvgExportView, toServer?: boolean, bridges?: StencilBridgeOptions | null) => void;
+  onExport: (format: DirectExportFormat, exportName: string, chooseFile?: boolean, svgView?: SvgExportView, toServer?: boolean, bridges?: StencilBridgeOptions | null, laser?: LaserLayerOptions | null) => void;
   /** The STL file this design exports into, once one was chosen (Chrome and Edge). */
   stlFileName?: string | null;
   onExportLyl: (exportName: string, historyLimit: LylHistoryLimit, target?: LylExportTarget) => void;
@@ -116,6 +118,10 @@ export function TopActionPanel({
   // Stencil bridges for the parts a cut would let fall out (the middle of an "o"): off unless asked for.
   const [bridgesOn, setBridgesOn] = useState(false);
   const [bridges, setBridges] = useState<StencilBridgeOptions>(DEFAULT_STENCIL_BRIDGES);
+  // Laser layers by colour (cut, score, engrave) and the kerf: off and 0 unless asked for.
+  const [laserLayersOn, setLaserLayersOn] = useState(false);
+  const [laser, setLaser] = useState<LaserLayerOptions>(DEFAULT_LASER_LAYERS);
+  const laserBodyColors = laserColors(estimateShapes.filter((shape) => !shape.hole && !shape.hidden).map((shape) => shape.color));
   // One body with a name of its own is exported under that name; a design file keeps the design's name.
   const ownObjectName = estimateShapes.length === 1 && hasOwnShapeName(estimateShapes[0]) ? estimateShapes[0].name!.trim() : null;
   const suggestedName = ownObjectName && exportFormat !== "lyl" ? ownObjectName : projectName;
@@ -282,7 +288,13 @@ export function TopActionPanel({
       const view = exportFormat === "dxf" ? dxfView : svgView;
       // Bridges go into a cut outline: the DXF, or the SVG's silhouette.
       const withBridges = bridgesOn && (exportFormat === "dxf" || (exportFormat === "svg" && svgView === "silhouette"));
-      onExport(exportFormat, exportName, false, view, toServer, withBridges ? bridges : null);
+      // Laser layers split the silhouette; the kerf goes into any cut outline. Neither asked for, the file is as before.
+      const laserView = exportFormat === "dxf" || (exportFormat === "svg" && svgView === "silhouette");
+      const kerf = normalizedKerf(laser.kerf);
+      const withLaser = laserView && (laserLayersOn || kerf > 0)
+        ? { processes: laserLayersOn && view === "silhouette" ? laser.processes : {}, kerf }
+        : null;
+      onExport(exportFormat, exportName, false, view, toServer, withBridges ? bridges : null, withLaser);
     }
   };
 
@@ -453,6 +465,7 @@ export function TopActionPanel({
                 </select>
               </label>
               {svgView === "silhouette" ? <StencilBridgeControls on={bridgesOn} options={bridges} onToggle={setBridgesOn} onChange={setBridges} /> : null}
+              {svgView === "silhouette" ? <LaserLayerControls on={laserLayersOn} showLayers options={laser} colors={laserBodyColors} onToggle={setLaserLayersOn} onChange={setLaser} /> : null}
             </section>
           ) : null}
 
@@ -466,6 +479,7 @@ export function TopActionPanel({
                 </select>
               </label>
               <StencilBridgeControls on={bridgesOn} options={bridges} onToggle={setBridgesOn} onChange={setBridges} />
+              <LaserLayerControls on={laserLayersOn} showLayers={dxfView === "silhouette"} options={laser} colors={laserBodyColors} onToggle={setLaserLayersOn} onChange={setLaser} />
             </section>
           ) : null}
 
@@ -707,6 +721,54 @@ function StencilBridgeControls({ on, options, onToggle, onChange }: { on: boolea
           </label>
         </>
       ) : null}
+    </>
+  );
+}
+
+/**
+ * The laser layers' switch, and with it on, what each body colour becomes (cut, score, engrave or left out); below,
+ * the kerf the cut outline is grown by. The footprint has no layers, only the kerf (`showLayers` false).
+ */
+function LaserLayerControls({ on, showLayers, options, colors, onToggle, onChange }: { on: boolean; showLayers: boolean; options: LaserLayerOptions; colors: readonly string[]; onToggle: (on: boolean) => void; onChange: (options: LaserLayerOptions) => void }) {
+  const [kerfText, setKerfText] = useState(options.kerf ? String(options.kerf) : "0");
+  const setProcess = (color: string, process: LaserProcess) => onChange({ ...options, processes: { ...options.processes, [color]: process } });
+  return (
+    <>
+      {showLayers ? (
+        <label className="export-image-option" title={t("export.laserLayersHint")}>
+          <input type="checkbox" checked={on} onChange={(event) => onToggle(event.currentTarget.checked)} />
+          <span>{t("export.laserLayers")}</span>
+        </label>
+      ) : null}
+      {showLayers && on ? (
+        <>
+          <span className="print-estimate-note">{t("export.laserLayersHint")}</span>
+          {colors.map((color) => (
+            <label key={color}>
+              <span aria-hidden="true" style={{ display: "inline-block", width: 12, height: 12, borderRadius: 2, background: color, border: "1px solid currentColor", verticalAlign: "middle", marginInlineEnd: 6 }} />
+              <strong>{t("export.laserColor", { color })}</strong>{" "}
+              <select aria-label={t("export.laserColor", { color })} value={laserProcessFor(options, color)} onChange={(event) => setProcess(color, event.target.value as LaserProcess)}>
+                {LASER_PROCESSES.map((process) => <option key={process} value={process}>{t(`export.laserProcess.${process}`)}</option>)}
+              </select>
+            </label>
+          ))}
+        </>
+      ) : null}
+      <label title={t("export.kerfHint")}>
+        <strong>{t("export.kerf")}</strong>{" "}
+        <input
+          type="text"
+          inputMode="decimal"
+          aria-label={t("export.kerf")}
+          value={kerfText}
+          style={{ width: "6em" }}
+          onChange={(event) => {
+            setKerfText(event.target.value);
+            // Comma or point (#210); what is no number counts as no kerf, more than MAX_KERF as MAX_KERF.
+            onChange({ ...options, kerf: normalizedKerf(parseMeasurementInput(event.target.value)) });
+          }}
+        />{" mm"}
+      </label>
     </>
   );
 }

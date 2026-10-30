@@ -333,9 +333,21 @@ function dxfNumber(value: number) {
  * y to the back), moved so the drawing's lower left corner is at 0,0, the round parts as arcs and circles.
  */
 export function outlinesToDxf({ loops }: DxfOutlines): DxfResult {
-  const flipped = loops
+  return layeredOutlinesToDxf([{ name: "0", color: 7, loops }]);
+}
+
+/** A DXF layer: its name, its AutoCAD colour index, and its closed outlines as DxfOutlines has them. */
+export type DxfLayerOutlines = DxfOutlines & { name: string; color: number };
+
+/**
+ * The DXF of closed outlines on layers of their own (laserLayers.ts: cut, score, engrave), all moved by the same amount,
+ * so the layers stay where they are against each other. One layer named "0" in colour 7 is the plain file outlinesToDxf writes.
+ */
+export function layeredOutlinesToDxf(layers: readonly DxfLayerOutlines[]): DxfResult {
+  const flippedLayers = layers.map((layer) => layer.loops
     .map((loop) => loop.map(([x, y]): DxfPoint => [x, -y]))
-    .filter((loop) => loop.length >= 3);
+    .filter((loop) => loop.length >= 3));
+  const flipped = flippedLayers.flat();
   let minX = Number.POSITIVE_INFINITY;
   let minY = Number.POSITIVE_INFINITY;
   let maxX = Number.NEGATIVE_INFINITY;
@@ -348,9 +360,12 @@ export function outlinesToDxf({ loops }: DxfOutlines): DxfResult {
     maxY = Math.max(maxY, y);
   }));
   if (!Number.isFinite(minX)) throw new Error("DXF export contains no readable contours");
-  const moved = flipped.map((loop) => loop.map(([x, y]): DxfPoint => [x - minX, y - minY]));
-  const entities = moved.flatMap((loop) => dxfLoopEntities(loop));
+  const layerEntities = flippedLayers.map((layerLoops) => layerLoops
+    .map((loop) => loop.map(([x, y]): DxfPoint => [x - minX, y - minY]))
+    .flatMap((loop) => dxfLoopEntities(loop)));
+  const entities = layerEntities.flat();
   if (entities.length === 0) throw new Error("DXF export contains no readable contours");
+  const entityLayers = layerEntities.flatMap((own, index) => own.map(() => index));
   const counts = {
     lines: entities.filter((entity) => entity.type === "line").length,
     arcs: entities.filter((entity) => entity.type === "arc").length,
@@ -358,16 +373,23 @@ export function outlinesToDxf({ loops }: DxfOutlines): DxfResult {
   };
   const width = maxX - minX;
   const height = maxY - minY;
-  return { dxf: dxfDocument(entities, { width, height }), entities, counts, width, height };
+  const dxfLayers = layers.map(({ name, color }) => ({ name, color }));
+  return { dxf: dxfDocument(entities, { width, height }, dxfLayers, entityLayers), entities, counts, width, height };
 }
 
 /**
  * A DXF 2000 file holding the entities in model space: the sections, tables and objects AutoCAD needs
  * for that version (HEADER with $ACADVER and $HANDSEED, CLASSES, the nine tables with their standard
  * entries, the two block records and blocks, ENTITIES, and OBJECTS with the root dictionary and
- * ACAD_GROUP), nothing more. Every entity on layer 0 in colour 7, linetype Continuous.
+ * ACAD_GROUP), nothing more. Without `layers`, every entity on layer 0 in colour 7, linetype Continuous; with them, entity
+ * i on layer `entityLayers[i]` in that layer's colour. Layer 0 is always in the table, as AutoCAD needs it.
  */
-export function dxfDocument(entities: readonly DxfEntity[], extents: { width: number; height: number }): string {
+export function dxfDocument(
+  entities: readonly DxfEntity[],
+  extents: { width: number; height: number },
+  layers: ReadonlyArray<{ name: string; color: number }> = [{ name: "0", color: 7 }],
+  entityLayers: readonly number[] = [],
+): string {
   const out: string[] = [];
   const pair = (code: number, value: string | number) => {
     out.push(String(code).padStart(3, " "), typeof value === "number" ? dxfNumber(value) : value);
@@ -384,6 +406,10 @@ export function dxfDocument(entities: readonly DxfEntity[], extents: { width: nu
     paperEnd: "1C", rootDictionary: "1D", groupDictionary: "1E",
   };
   const entityHandles = entities.map(() => handle());
+  // Layer 0 first, as AutoCAD keeps it, then the named layers, each once.
+  const ownLayers = layers.filter((layer) => layer.name !== "0");
+  const layer0Color = layers.find((layer) => layer.name === "0")?.color ?? 7;
+  const layerHandles = ownLayers.map(() => handle());
 
   const section = (name: string) => { pair(0, "SECTION"); pair(2, name); };
   const endSection = () => pair(0, "ENDSEC");
@@ -426,10 +452,14 @@ export function dxfDocument(entities: readonly DxfEntity[], extents: { width: nu
     pair(2, name); int(70, 0); pair(3, name === "Continuous" ? "Solid line" : ""); int(72, 65); int(73, 0); pair(40, 0);
   }
   pair(0, "ENDTAB");
-  table("LAYER", H.layerTable, 1);
+  table("LAYER", H.layerTable, 1 + ownLayers.length);
   record("LAYER", H.layer0, H.layerTable, "AcDbLayerTableRecord");
   // Layer 0, white (7), solid, lineweight 0.00 mm: a cut contour as shops read it.
-  pair(2, "0"); int(70, 0); int(62, 7); pair(6, "Continuous"); int(370, 0);
+  pair(2, "0"); int(70, 0); int(62, layer0Color); pair(6, "Continuous"); int(370, 0);
+  ownLayers.forEach((layer, index) => {
+    record("LAYER", layerHandles[index], H.layerTable, "AcDbLayerTableRecord");
+    pair(2, layer.name); int(70, 0); int(62, layer.color); pair(6, "Continuous"); int(370, 0);
+  });
   pair(0, "ENDTAB");
   table("STYLE", H.styleTable, 1);
   record("STYLE", H.standardStyle, H.styleTable, "AcDbTextStyleTableRecord");
@@ -463,8 +493,9 @@ export function dxfDocument(entities: readonly DxfEntity[], extents: { width: nu
 
   section("ENTITIES");
   entities.forEach((entity, index) => {
+    const layer = layers[entityLayers[index] ?? 0] ?? { name: "0", color: 7 };
     const common = (type: string) => {
-      pair(0, type); pair(5, entityHandles[index]); pair(330, H.modelRecord); pair(100, "AcDbEntity"); pair(8, "0"); int(62, 7); pair(6, "Continuous");
+      pair(0, type); pair(5, entityHandles[index]); pair(330, H.modelRecord); pair(100, "AcDbEntity"); pair(8, layer.name); int(62, layer.color); pair(6, "Continuous");
     };
     if (entity.type === "line") {
       common("LINE"); pair(100, "AcDbLine");
